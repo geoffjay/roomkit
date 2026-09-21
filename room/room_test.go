@@ -178,3 +178,35 @@ func TestPresenceIsPerRoom(t *testing.T) {
 		t.Errorf("scope presence = %d, want 2", got)
 	}
 }
+
+// TestRestoreScopeKeepsIdentity defends the durable half of a scope. A
+// persistent app restarts, and the share links it handed out plus the
+// agent token it configured into a bridge must still work. Minting
+// fresh ones would silently unpair every bridge.
+func TestRestoreScopeKeepsIdentity(t *testing.T) {
+	h := NewHub()
+	orig := h.NewScope(RoleSuggester)
+	id, tok := orig.ID(), orig.AgentToken()
+
+	// The process dies; a new hub comes up from the app's store.
+	h2 := NewHub()
+	got := h2.RestoreScope(id, tok, RoleSuggester)
+	if got.ID() != id {
+		t.Fatalf("restored id = %q, want %q", got.ID(), id)
+	}
+	if got.AgentToken() != tok {
+		t.Fatalf("restored agent token = %q, want %q", got.AgentToken(), tok)
+	}
+	if h2.Scope(id) != got {
+		t.Fatal("a restored scope must be reachable by id from the hub")
+	}
+	// Restoring twice is the same scope, not a second one that would
+	// split the live clients of one room across two objects.
+	if again := h2.RestoreScope(id, tok, RoleSuggester); again != got {
+		t.Fatal("RestoreScope must be idempotent for one id")
+	}
+	// Live state is per-connection and is not restored.
+	if len(got.Members()) != 0 {
+		t.Fatalf("restored scope carried %d members, want 0", len(got.Members()))
+	}
+}

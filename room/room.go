@@ -167,6 +167,44 @@ func (h *Hub) NewScope(agentCap string) *Scope {
 	return s
 }
 
+// RestoreScope rebuilds a scope that already exists in an app's store,
+// keeping its identifier and its agent token.
+//
+// A scope's id and agent token are durable facts: the id appears in
+// share links and the agent token is configured into a bridge out of
+// band. Minting fresh ones on restart would break every paired bridge
+// and invalidate every link, so a persistent app restores instead of
+// creating. Both values stay opaque here; the app owns their storage.
+//
+// Live state is deliberately not restored. Members, clients, and rate
+// buckets are per-connection facts that a reconnect re-establishes.
+func (h *Hub) RestoreScope(id, agentToken, agentCap string) *Scope {
+	if id == "" {
+		return h.NewScope(agentCap)
+	}
+	if agentCap == "" {
+		agentCap = RoleSuggester
+	}
+	if agentToken == "" {
+		agentToken = NewID()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if s, ok := h.scopes[id]; ok {
+		return s
+	}
+	s := &Scope{
+		id:         id,
+		agentToken: agentToken,
+		agentCap:   agentCap,
+		members:    map[string]*Actor{},
+		clients:    map[*Client]bool{},
+		rates:      map[string][]time.Time{},
+	}
+	h.scopes[id] = s
+	return s
+}
+
 // Scope returns a scope by id, or nil.
 func (h *Hub) Scope(id string) *Scope {
 	h.mu.Lock()
