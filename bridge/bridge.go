@@ -102,7 +102,13 @@ func (c *Client) Listen(ctx context.Context, wsURL string, backoff time.Duration
 }
 
 func (c *Client) listenOnce(ctx context.Context, wsURL string, handle func(room.Event)) error {
-	conn, err := mcp.Dial(ctx, wsURL)
+	// The credential travels as a header. A token in a query string is
+	// a token in every access log between here and the app.
+	h := http.Header{}
+	if c.Token != "" {
+		h.Set(c.TokenHead, c.Token)
+	}
+	conn, err := mcp.DialHeader(ctx, wsURL, h)
 	if err != nil {
 		return err
 	}

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"sync"
 
@@ -29,7 +30,20 @@ type Conn = websocket.Conn
 
 // Dial opens an outbound WebSocket.
 func Dial(ctx context.Context, url string) (*Conn, error) {
-	c, _, err := websocket.Dial(ctx, url, nil)
+	return DialHeader(ctx, url, nil)
+}
+
+// DialHeader opens the bridge's outbound WebSocket carrying headers.
+//
+// A credential belongs in a header, not in the URL. Query strings are
+// written to access logs, kept in proxy history, and handed on in
+// referrers, so a token in one is a token disclosed.
+func DialHeader(ctx context.Context, url string, h http.Header) (*Conn, error) {
+	var opts *websocket.DialOptions
+	if len(h) > 0 {
+		opts = &websocket.DialOptions{HTTPHeader: h}
+	}
+	c, _, err := websocket.Dial(ctx, url, opts)
 	if err != nil {
 		return nil, err
 	}

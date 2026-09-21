@@ -8,6 +8,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/geoffjay/roomkit/room"
+	"time"
 )
 
 // The ocre spike verified that a stray API key silently overrides the
@@ -145,5 +148,35 @@ func TestDriveRefusesToolsOnANonMCPRuntime(t *testing.T) {
 		if strings.Contains(err.Error(), "cannot be given an MCP server") {
 			t.Fatalf("a tool-free invocation must not be refused: %v", err)
 		}
+	}
+}
+
+// TestListenSendsTheCredentialAsAHeader: a bridge authenticates with a
+// durable token, and a token in a query string is written to every
+// access log, proxy history and referrer between the bridge and the
+// app. It must ride in the header instead.
+func TestListenSendsTheCredentialAsAHeader(t *testing.T) {
+	got := make(chan *http.Request, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Clone(context.Background())
+		w.WriteHeader(http.StatusBadRequest) // refuse the upgrade; the request is the assertion
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "space-1", "tok-secret", "X-Lore-Token")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go c.Listen(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws", 50*time.Millisecond, func(room.Event) {})
+
+	select {
+	case r := <-got:
+		if h := r.Header.Get("X-Lore-Token"); h != "tok-secret" {
+			t.Fatalf("X-Lore-Token header = %q, want the bridge token", h)
+		}
+		if strings.Contains(r.URL.RawQuery, "tok-secret") {
+			t.Fatalf("the credential is in the query string: %q", r.URL.RawQuery)
+		}
+	case <-ctx.Done():
+		t.Fatal("the bridge never dialled")
 	}
 }
