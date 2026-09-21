@@ -26,6 +26,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -90,6 +91,43 @@ type Event struct {
 // governance vocabulary ("verdict", "suggestion") appears here.
 type Policy func(actor Actor, action string, payload map[string]any) error
 
+// Refusal is a policy rejection that carries the status the app's
+// transport should report. A policy that returns a plain error is
+// refusing without an opinion on the status, and RefusalCode then
+// answers with the caller's fallback.
+//
+// Return it by value so errors.As finds it through a wrapper:
+//
+//	return room.Refusal{Code: http.StatusTooManyRequests, Reason: "..."}
+//
+// Code is an int, not an HTTP constant, because the transport is the
+// app's business. Nothing here reads it.
+type Refusal struct {
+	Code   int    `json:"code"`
+	Reason string `json:"reason"`
+}
+
+// Error implements error.
+func (r Refusal) Error() string {
+	if r.Reason == "" {
+		return "refused"
+	}
+	return r.Reason
+}
+
+// RefusalCode reports the status a refusal asked for, or fallback when
+// err is nil, is not a Refusal, or carries no code.
+//
+// Every app that runs policies writes this lookup, so it lives here
+// rather than in each of them.
+func RefusalCode(err error, fallback int) int {
+	var r Refusal
+	if errors.As(err, &r) && r.Code != 0 {
+		return r.Code
+	}
+	return fallback
+}
+
 // ---------- transport ----------
 
 // Sink receives serialized events. A websocket connection satisfies it
@@ -126,6 +164,9 @@ type Scope struct {
 	clients  map[*Client]bool
 	rates    map[string][]time.Time
 	policies []Policy
+
+	ping time.Duration
+	idle time.Duration
 }
 
 // Hub holds every scope.
@@ -244,19 +285,21 @@ func (s *Scope) Check(actor Actor, action string, payload map[string]any) error 
 // are idempotent by display name, so one person in two tabs is one
 // actor. Agents share the scope's agent token and are capped at the
 // scope's agent ceiling.
+//
+// An agent join names an actor the token may already have minted, so
+// it fills in the display name and runtime the socket brought rather
+// than replacing the actor: its id is the durable half.
 func (s *Scope) Join(kind, name, runtime, role string) (Actor, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if kind == "agent" {
-		if a, ok := s.members[s.agentToken]; ok {
-			return *a, s.agentToken
+		a := s.agentLocked()
+		if name != "" {
+			a.DisplayName = name
 		}
-		a := &Actor{
-			Kind: "agent", ID: "agent-" + s.id[:4], DisplayName: name,
-			Runtime: runtime, OwnerID: "owner",
-			Role: Min(RoleOwner, s.agentCap),
+		if runtime != "" {
+			a.Runtime = runtime
 		}
-		s.members[s.agentToken] = a
 		return *a, s.agentToken
 	}
 	for tok, a := range s.members {
@@ -273,13 +316,42 @@ func (s *Scope) Join(kind, name, runtime, role string) (Actor, string) {
 	return *a, tok
 }
 
+// agentLocked returns the scope's agent actor, minting it on first
+// use. The caller holds s.mu.
+func (s *Scope) agentLocked() *Actor {
+	if a, ok := s.members[s.agentToken]; ok {
+		return a
+	}
+	short := s.id
+	if len(short) > 4 {
+		short = short[:4]
+	}
+	a := &Actor{
+		Kind: "agent", ID: "agent-" + short, DisplayName: "agent",
+		OwnerID: "owner", Role: Min(RoleOwner, s.agentCap),
+	}
+	s.members[s.agentToken] = a
+	return a
+}
+
 // ActorByToken resolves the acting participant from its token.
+//
+// The scope's agent token resolves whether or not a bridge has opened
+// a socket. A join is a connection event, but the agent token is a
+// durable fact the app configured out of band, so requiring a live
+// socket would refuse a bridge's first action whenever it raced its
+// own connection — which is a 401 for a credential that was valid all
+// along.
 func (s *Scope) ActorByToken(tok string) *Actor {
 	if tok == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if tok == s.agentToken {
+		cp := *s.agentLocked()
+		return &cp
+	}
 	if a, ok := s.members[tok]; ok {
 		cp := *a
 		return &cp
@@ -438,12 +510,90 @@ func (s *Scope) Serve(w http.ResponseWriter, req *http.Request, actor Actor, res
 		s.Broadcast(resource, Event{Type: "presence.left", Actor: &actor})
 		conn.CloseNow()
 	}()
+	return s.ReadLoop(req.Context(), conn)
+}
+
+// Keepalive defaults. A client that has nothing to say is not a
+// client that has gone away: without a ping, a socket that hears
+// nothing for the read deadline is dropped on a timer and reconnects,
+// which churns presence for everyone else in the room.
+const (
+	// DefaultPing is how often a live socket is pinged.
+	DefaultPing = 30 * time.Second
+	// DefaultIdle is how long a ping may go unanswered before the
+	// socket is treated as gone. It must exceed the ping interval.
+	DefaultIdle = 90 * time.Second
+)
+
+// SetKeepalive overrides this scope's ping interval and idle window
+// for sockets served after the call. A non-positive value restores
+// the default; an idle window shorter than the ping interval is
+// raised to three times it, because a deadline that expires before
+// the answer can arrive is the bug this replaces.
+func (s *Scope) SetKeepalive(ping, idle time.Duration) {
+	s.mu.Lock()
+	s.ping, s.idle = ping, idle
+	s.mu.Unlock()
+}
+
+func (s *Scope) keepalive() (ping, idle time.Duration) {
+	s.mu.Lock()
+	ping, idle = s.ping, s.idle
+	s.mu.Unlock()
+	if ping <= 0 {
+		ping = DefaultPing
+	}
+	if idle <= 0 {
+		idle = DefaultIdle
+	}
+	if idle <= ping {
+		idle = 3 * ping
+	}
+	return ping, idle
+}
+
+// ReadLoop reads a served socket until the peer goes away, pinging on
+// this scope's keepalive interval. It discards what it reads: a room
+// is a delivery channel, and an app that wants inbound messages has a
+// REST boundary where its policies run.
+//
+// Serve calls it. It is exported for an app that accepts the socket
+// itself — to wrap the sink, say — because the loop such an app would
+// otherwise write is the one that dropped every idle client.
+func (s *Scope) ReadLoop(ctx context.Context, conn *websocket.Conn) error {
+	ping, idle := s.keepalive()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		Keepalive(ctx, conn, ping, idle)
+		cancel()
+	}()
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		_, _, err := conn.Read(ctx)
+		if _, _, err := conn.Read(ctx); err != nil {
+			return nil
+		}
+	}
+}
+
+// Keepalive pings conn every ping interval and returns once a ping
+// goes unanswered for idle, the socket fails, or ctx ends.
+//
+// Run it beside a reader. A pong is read by whatever call is reading
+// the socket, so a ping with nothing reading can never be answered.
+func Keepalive(ctx context.Context, conn *websocket.Conn, ping, idle time.Duration) error {
+	t := time.NewTicker(ping)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+		pctx, cancel := context.WithTimeout(ctx, idle)
+		err := conn.Ping(pctx)
 		cancel()
 		if err != nil {
-			return nil
+			return err
 		}
 	}
 }

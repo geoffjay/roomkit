@@ -36,32 +36,43 @@ const (
 
 // Resolver maps an anchor forward onto new content. Implementations
 // must not modify the anchor they are given.
+//
+// base is the content as the anchor saw it, at a.BaseRevision; head
+// is the content now. Both halves are here because the matching half
+// of this package, LineRange, needs both: a resolver handed only head
+// cannot say where the anchored text used to be, so every consumer
+// closed over its own revision store to feed a helper that ships in
+// this package. The caller owns revision storage and passes the two
+// contents in, the same way it already passed head.
 type Resolver interface {
-	Resolve(a Anchor, headRevision string, head []byte) (Status, Anchor)
+	Resolve(a Anchor, headRevision string, base, head []byte) (Status, Anchor)
 }
 
 // ResolverFunc adapts a function to Resolver.
-type ResolverFunc func(a Anchor, headRevision string, head []byte) (Status, Anchor)
+type ResolverFunc func(a Anchor, headRevision string, base, head []byte) (Status, Anchor)
 
 // Resolve implements Resolver.
-func (f ResolverFunc) Resolve(a Anchor, headRevision string, head []byte) (Status, Anchor) {
-	return f(a, headRevision, head)
+func (f ResolverFunc) Resolve(a Anchor, headRevision string, base, head []byte) (Status, Anchor) {
+	return f(a, headRevision, base, head)
 }
 
 // Remap re-resolves an anchor against head. An anchor recorded at the
 // head revision resolves unchanged without consulting the resolver.
 // With no resolver, a stale anchor is Outdated rather than guessed.
 //
+// base is the content at a.BaseRevision and head the content at
+// headRevision.
+//
 // Remap never mutates its input: on Moved it returns a new anchor
 // carrying the head revision.
-func Remap(r Resolver, a Anchor, headRevision string, head []byte) (Status, Anchor) {
+func Remap(r Resolver, a Anchor, headRevision string, base, head []byte) (Status, Anchor) {
 	if a.BaseRevision == headRevision {
 		return Resolved, a
 	}
 	if r == nil {
 		return Outdated, a
 	}
-	status, next := r.Resolve(a, headRevision, head)
+	status, next := r.Resolve(a, headRevision, base, head)
 	if status == Moved {
 		next.BaseRevision = headRevision
 		if next.Scheme == "" {
@@ -72,7 +83,10 @@ func Remap(r Resolver, a Anchor, headRevision string, head []byte) (Status, Anch
 }
 
 // LineRange locates a 1-based inclusive line range from old content
-// inside new content by matching the anchored text exactly.
+// inside new content by matching the anchored text exactly. old and
+// next are the base and head a Resolver is handed, so a line-based
+// scheme composes the two halves of this package without reaching
+// for a revision store of its own.
 //
 // This is the generic half of the renumbering problem a knowledge or
 // review document hits whenever an edit inserts or removes lines above

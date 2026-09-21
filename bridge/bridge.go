@@ -129,10 +129,21 @@ func (c *Client) listenOnce(ctx context.Context, wsURL string, handle func(room.
 		return err
 	}
 	defer conn.CloseNow()
-	for {
-		rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		_, data, err := conn.Read(rctx)
+
+	// A bridge that hears nothing is not a bridge that has gone away.
+	// The read carried an arbitrary deadline, which dropped a healthy
+	// socket on a timer; liveness is the ping's job, and the ping also
+	// keeps every NAT between here and the app from forgetting the
+	// connection.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		room.Keepalive(ctx, conn, room.DefaultPing, room.DefaultIdle)
 		cancel()
+	}()
+
+	for {
+		_, data, err := conn.Read(ctx)
 		if err != nil {
 			return err
 		}
@@ -163,6 +174,11 @@ type Invocation struct {
 	MCPConfig string
 	// AllowTools is the exact set of tool names the run may call.
 	AllowTools []string
+	// Timeout bounds the run. Zero means DefaultTimeout: a runtime
+	// that hangs would otherwise pin the goroutine that drove it for
+	// as long as the process lives, and the caller that remembers to
+	// set its own deadline is the one that did not need the default.
+	Timeout time.Duration
 }
 
 // Runtime describes how to invoke an agent runtime headlessly.
@@ -240,9 +256,17 @@ func SanitizeEnv(env []string) []string {
 	return out
 }
 
-// Drive invokes the owner's runtime headlessly and returns its output.
-// The runtime runs on the owner's machine with the owner's
-// credentials; roomkit never sees a key.
+// DefaultTimeout bounds a run that set no Timeout of its own.
+const DefaultTimeout = 120 * time.Second
+
+// Drive invokes the owner's runtime headlessly and returns what it
+// wrote to stdout. The runtime runs on the owner's machine with the
+// owner's credentials; roomkit never sees a key.
+//
+// stderr is not part of the answer. A runtime writes progress lines,
+// deprecation notices and warnings there, and a caller that parses
+// the output would parse those too. It arrives in the error instead,
+// where it is diagnosis rather than content.
 //
 // An invocation that grants tools through a runtime with no MCP
 // support is refused. Running it anyway would produce a plausible
@@ -256,11 +280,24 @@ func Drive(ctx context.Context, runtime string, in Invocation) (string, error) {
 	if in.MCPConfig != "" && !rt.MCP {
 		return "", fmt.Errorf("runtime %q cannot be given an MCP server on the command line", runtime)
 	}
+	timeout := in.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var stdout, stderr strings.Builder
 	cmd := exec.CommandContext(ctx, rt.Name, rt.Args(in)...)
 	cmd.Env = SanitizeEnv(os.Environ())
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("%s: %w: %s", runtime, err, strings.TrimSpace(string(out)))
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return stdout.String(), fmt.Errorf("%s: gave up after %s: %s", runtime, timeout, strings.TrimSpace(stderr.String()))
 	}
-	return string(out), nil
+	if err != nil {
+		return stdout.String(), fmt.Errorf("%s: %w: %s", runtime, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
 }

@@ -220,3 +220,70 @@ func TestGetIsAuthenticatedAndReportsRefusals(t *testing.T) {
 		t.Fatalf("the app's reason was dropped: %v", body)
 	}
 }
+
+// shellRuntime registers a shell-backed runtime for one test, so
+// Drive's real exec path runs without an installed agent runtime.
+// The script is the invocation's prompt.
+func shellRuntime(t *testing.T) string {
+	t.Helper()
+	name := "test-shell"
+	Runtimes[name] = Runtime{Name: "sh", Args: func(in Invocation) []string {
+		return []string{"-c", in.Prompt}
+	}}
+	t.Cleanup(func() { delete(Runtimes, name) })
+	return name
+}
+
+// TestDriveReturnsStdoutOnly is finding #12 from the second consumer.
+// Drive returned CombinedOutput, so a runtime's progress lines and
+// warnings landed inside the text the caller parses. The answer is
+// stdout; stderr is diagnosis and belongs in the error.
+func TestDriveReturnsStdoutOnly(t *testing.T) {
+	rt := shellRuntime(t)
+
+	out, err := Drive(t.Context(), rt, Invocation{
+		Prompt: `echo "warning: model deprecated" >&2; echo "the answer"`,
+	})
+	if err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	if strings.TrimSpace(out) != "the answer" {
+		t.Errorf("output = %q, want stdout alone", out)
+	}
+
+	// A failing run reports stderr instead of hiding it.
+	out, err = Drive(t.Context(), rt, Invocation{
+		Prompt: `echo partial; echo "no credentials" >&2; exit 3`,
+	})
+	if err == nil {
+		t.Fatal("a failing runtime returned success")
+	}
+	if !strings.Contains(err.Error(), "no credentials") {
+		t.Errorf("error dropped stderr: %v", err)
+	}
+	if strings.Contains(out, "no credentials") {
+		t.Errorf("stderr contaminated the answer: %q", out)
+	}
+}
+
+// TestDriveGivesUpOnAHungRuntime is finding #13. Without a deadline of
+// its own, a runtime that never exits pins the goroutine that drove
+// it for as long as the bridge lives.
+func TestDriveGivesUpOnAHungRuntime(t *testing.T) {
+	rt := shellRuntime(t)
+
+	start := time.Now()
+	_, err := Drive(t.Context(), rt, Invocation{Prompt: "sleep 30", Timeout: 100 * time.Millisecond})
+	if err == nil {
+		t.Fatal("a runtime that outlived its timeout returned success")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("drive waited %s for a 100ms timeout", elapsed)
+	}
+	if !strings.Contains(err.Error(), "gave up") {
+		t.Errorf("error should name the deadline; got %v", err)
+	}
+	if DefaultTimeout <= 0 {
+		t.Error("an invocation with no timeout of its own must still be bounded")
+	}
+}
