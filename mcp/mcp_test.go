@@ -113,3 +113,55 @@ func TestNotificationsGetNoReply(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestObjEmitsSchemaObjects holds the shape a validating MCP client
+// requires. A property value must be a schema object; the bare type
+// name reads correctly and is rejected on the wire, which is how this
+// shipped unnoticed until a real runtime loaded the tools.
+func TestObjEmitsSchemaObjects(t *testing.T) {
+	s := Obj(map[string]any{
+		"doc_id":     "string",
+		"line_start": "number",
+		"severity":   map[string]any{"type": "string", "enum": []string{"high", "medium", "low"}},
+	})
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing: %#v", s)
+	}
+	for name, v := range props {
+		m, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("property %q is %T, want a schema object", name, v)
+		}
+		if _, ok := m["type"]; !ok {
+			t.Fatalf("property %q has no type: %#v", name, m)
+		}
+	}
+	if got := props["doc_id"].(map[string]any)["type"]; got != "string" {
+		t.Fatalf("doc_id type = %v", got)
+	}
+	// An already-built schema passes through with its extras intact.
+	if _, ok := props["severity"].(map[string]any)["enum"]; !ok {
+		t.Fatal("a pre-built property schema must pass through unchanged")
+	}
+	if s["type"] != "object" {
+		t.Fatalf("root type = %v, want object", s["type"])
+	}
+	// The whole thing must survive the trip to a client.
+	if _, err := json.Marshal(s); err != nil {
+		t.Fatalf("schema does not marshal: %v", err)
+	}
+}
+
+// TestRequiredOnlyNamesDeclaredProperties: a required key pointing at
+// a property that does not exist makes every call invalid.
+func TestRequiredOnlyNamesDeclaredProperties(t *testing.T) {
+	s := Required(Obj(map[string]any{"doc_id": "string"}), "doc_id", "renamed_away")
+	req, _ := s["required"].([]string)
+	if len(req) != 1 || req[0] != "doc_id" {
+		t.Fatalf("required = %v, want [doc_id]", req)
+	}
+	if _, ok := Obj(map[string]any{})["required"]; ok {
+		t.Fatal("a schema with no required properties must not declare the key")
+	}
+}

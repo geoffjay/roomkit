@@ -63,9 +63,50 @@ func NewServer(name, version string) *Server {
 	return &Server{name: name, version: version, tools: map[string]Tool{}}
 }
 
-// Obj builds a JSON-Schema object schema from a name to type map.
+// Obj builds a JSON Schema object from a shorthand property map.
+//
+// A value may be a type name — "string", "number", "integer",
+// "boolean", "object", "array" — which becomes {"type": name}, or an
+// already-built schema, which passes through unchanged so a caller
+// can add a description or an enum.
+//
+// The wrapping matters: a JSON Schema property value must be a schema
+// object. Emitting the bare type name produces a document that reads
+// correctly and is rejected by any validating client.
 func Obj(props map[string]any) map[string]any {
-	return map[string]any{"type": "object", "properties": props}
+	out := make(map[string]any, len(props))
+	for name, spec := range props {
+		switch v := spec.(type) {
+		case string:
+			out[name] = map[string]any{"type": v}
+		case map[string]any:
+			out[name] = v
+		default:
+			out[name] = map[string]any{"type": "string"}
+		}
+	}
+	return map[string]any{
+		"$schema":    "https://json-schema.org/draft/2020-12/schema",
+		"type":       "object",
+		"properties": out,
+	}
+}
+
+// Required marks properties of an object schema as required. Names
+// that the schema does not declare are ignored, so a rename cannot
+// leave a required key pointing at nothing.
+func Required(schema map[string]any, names ...string) map[string]any {
+	props, _ := schema["properties"].(map[string]any)
+	req := make([]string, 0, len(names))
+	for _, n := range names {
+		if _, ok := props[n]; ok {
+			req = append(req, n)
+		}
+	}
+	if len(req) > 0 {
+		schema["required"] = req
+	}
+	return schema
 }
 
 // Tool registers a capability.
