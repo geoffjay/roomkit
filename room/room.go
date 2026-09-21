@@ -304,13 +304,19 @@ func (s *Scope) Members() []Actor {
 
 // Presence lists actors attached to one room. The empty resource lists
 // every actor attached anywhere in the scope.
+//
+// A scope-wide subscriber is present in every room, because Broadcast
+// delivers every room's events to it. Presence and delivery use the
+// same rule on purpose: a participant that receives a room's events
+// but is reported absent from it is a participant nobody addresses.
+// A bridge attached scope-wide is the case that matters.
 func (s *Scope) Presence(resource string) []Actor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seen := map[string]bool{}
 	out := []Actor{}
 	for c := range s.clients {
-		if resource != "" && c.resource != resource {
+		if resource != "" && c.resource != "" && c.resource != resource {
 			continue
 		}
 		if !seen[c.actor.ID] {

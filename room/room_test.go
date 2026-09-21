@@ -210,3 +210,46 @@ func TestRestoreScopeKeepsIdentity(t *testing.T) {
 		t.Fatalf("restored scope carried %d members, want 0", len(got.Members()))
 	}
 }
+
+// TestPresenceMatchesDelivery holds presence and Broadcast to the same
+// rule. A bridge attaches scope-wide and therefore receives every
+// room's events; reporting it absent from those rooms would make it a
+// participant nobody can address.
+func TestPresenceMatchesDelivery(t *testing.T) {
+	h := NewHub()
+	s := h.NewScope(RoleSuggester)
+	reader, _ := s.Join("human", "Reader", "", RoleEditor)
+	agent, _ := s.Join("agent", "bridge", "claude", RoleSuggester)
+
+	var inRoom, scopeWide capture
+	s.Attach(&inRoom, reader, "doc-a")
+	s.Attach(&scopeWide, agent, "") // a bridge listens to the whole scope
+
+	// Delivery: the scope-wide subscriber gets doc-a's event.
+	s.Broadcast("doc-a", Event{Type: "contribution.created"})
+	if got := len(scopeWide.types()); got != 1 {
+		t.Fatalf("scope-wide subscriber received %d events for doc-a, want 1", got)
+	}
+
+	// Presence must agree with that.
+	names := map[string]bool{}
+	for _, a := range s.Presence("doc-a") {
+		names[a.DisplayName] = true
+	}
+	if !names["bridge"] {
+		t.Fatal("a scope-wide subscriber receives doc-a events but is absent from doc-a presence")
+	}
+	if !names["Reader"] {
+		t.Fatal("the in-room client is missing from presence")
+	}
+
+	// A client in a different room is still excluded.
+	var other capture
+	third, _ := s.Join("human", "Elsewhere", "", RoleEditor)
+	s.Attach(&other, third, "doc-b")
+	for _, a := range s.Presence("doc-a") {
+		if a.DisplayName == "Elsewhere" {
+			t.Fatal("a client attached to doc-b must not appear in doc-a presence")
+		}
+	}
+}
