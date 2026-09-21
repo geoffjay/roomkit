@@ -67,9 +67,22 @@ func (c *Client) Action(path string, body any) (map[string]any, error) {
 	return out, nil
 }
 
-// Get reads a JSON resource from the app.
+// Get reads a JSON resource from the app, carrying the bridge's
+// credential and reporting a refusal as an error.
+//
+// It previously sent no token and ignored the status code, so a read
+// was anonymous and a 401 arrived looking like an empty success. An
+// app that authenticates its reads would have seen the bridge as a
+// stranger, and the caller would have seen nothing wrong.
 func (c *Client) Get(path string) (map[string]any, error) {
-	resp, err := c.HTTP.Get(c.BaseURL + path)
+	req, err := http.NewRequest(http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Token != "" {
+		req.Header.Set(c.TokenHead, c.Token)
+	}
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +91,9 @@ func (c *Client) Get(path string) (map[string]any, error) {
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("%s: %s", path, strings.TrimSpace(string(raw)))
+	}
+	if resp.StatusCode >= 300 {
+		return out, fmt.Errorf("read %s rejected (%d): %s", path, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return out, nil
 }

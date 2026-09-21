@@ -180,3 +180,43 @@ func TestListenSendsTheCredentialAsAHeader(t *testing.T) {
 		t.Fatal("the bridge never dialled")
 	}
 }
+
+// TestGetIsAuthenticatedAndReportsRefusals: a read carries the same
+// credential as an action, and a refusal is an error rather than an
+// empty success. Without both, an app that authenticates its reads
+// sees the bridge as a stranger and the caller notices nothing.
+func TestGetIsAuthenticatedAndReportsRefusals(t *testing.T) {
+	var sawToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawToken = r.Header.Get("X-Lore-Token")
+		if sawToken == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"sign in"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "s", "tok-secret", "X-Lore-Token")
+	out, err := c.Get("/api/thing")
+	if err != nil {
+		t.Fatalf("an authenticated read failed: %v", err)
+	}
+	if sawToken != "tok-secret" {
+		t.Fatalf("read sent token %q, want the bridge token", sawToken)
+	}
+	if out["ok"] != true {
+		t.Fatalf("body = %v", out)
+	}
+
+	// An unauthenticated client must be told it was refused.
+	anon := New(srv.URL, "s", "", "X-Lore-Token")
+	body, err := anon.Get("/api/thing")
+	if err == nil {
+		t.Fatal("a 401 read returned success")
+	}
+	if body["error"] != "sign in" {
+		t.Fatalf("the app's reason was dropped: %v", body)
+	}
+}
