@@ -124,18 +124,71 @@ func (c *Client) listenOnce(ctx context.Context, wsURL string, handle func(room.
 
 // ---------- runtime driving ----------
 
+// Invocation is one headless run of an owner's runtime.
+type Invocation struct {
+	// Prompt is the instruction the runtime receives.
+	Prompt string
+	// Model pins the model for this run. An empty Model leaves the
+	// choice to the runtime's own default, which is a silent
+	// dependency on whatever that default becomes — a deprecated
+	// model can be substituted underneath a working bridge without
+	// any signal. Callers that care should set it.
+	Model string
+	// MCPConfig is a path to a JSON MCP server configuration. When it
+	// is set the runtime is also told to ignore every other MCP
+	// source, so a run carries exactly the tools the caller granted
+	// and never inherits the owner's unrelated servers.
+	MCPConfig string
+	// AllowTools is the exact set of tool names the run may call.
+	AllowTools []string
+}
+
 // Runtime describes how to invoke an agent runtime headlessly.
 type Runtime struct {
 	Name string
-	Args func(prompt string) []string
+	Args func(Invocation) []string
+	// MCP reports whether this runtime accepts an MCP server on the
+	// command line. Driving a tool-using invocation through a runtime
+	// that cannot is an error, not a silent run without tools.
+	MCP bool
 }
 
 // Runtimes are the runtimes verified against this bridge shape.
 var Runtimes = map[string]Runtime{
-	"claude":   {Name: "claude", Args: func(p string) []string { return []string{"-p", p} }},
-	"codex":    {Name: "codex", Args: func(p string) []string { return []string{"exec", p} }},
-	"opencode": {Name: "opencode", Args: func(p string) []string { return []string{"run", p} }},
-	"gemini":   {Name: "gemini", Args: func(p string) []string { return []string{"-p", p} }},
+	"claude": {Name: "claude", MCP: true, Args: func(in Invocation) []string {
+		a := []string{"-p", in.Prompt}
+		if in.Model != "" {
+			a = append(a, "--model", in.Model)
+		}
+		if in.MCPConfig != "" {
+			a = append(a, "--mcp-config", in.MCPConfig, "--strict-mcp-config", "--permission-mode", "dontAsk")
+		}
+		if len(in.AllowTools) > 0 {
+			a = append(a, append([]string{"--allowedTools"}, in.AllowTools...)...)
+		}
+		return a
+	}},
+	"codex": {Name: "codex", Args: func(in Invocation) []string {
+		a := []string{"exec"}
+		if in.Model != "" {
+			a = append(a, "--model", in.Model)
+		}
+		return append(a, in.Prompt)
+	}},
+	"opencode": {Name: "opencode", Args: func(in Invocation) []string {
+		a := []string{"run"}
+		if in.Model != "" {
+			a = append(a, "--model", in.Model)
+		}
+		return append(a, in.Prompt)
+	}},
+	"gemini": {Name: "gemini", Args: func(in Invocation) []string {
+		a := []string{"-p", in.Prompt}
+		if in.Model != "" {
+			a = append(a, "-m", in.Model)
+		}
+		return a
+	}},
 }
 
 // overrideVars are environment variables that silently replace the
@@ -165,15 +218,23 @@ func SanitizeEnv(env []string) []string {
 	return out
 }
 
-// Drive invokes the owner's runtime headlessly with the prompt and
-// returns its output. The runtime runs on the owner's machine with the
-// owner's credentials; roomkit never sees a key.
-func Drive(ctx context.Context, runtime, prompt string) (string, error) {
+// Drive invokes the owner's runtime headlessly and returns its output.
+// The runtime runs on the owner's machine with the owner's
+// credentials; roomkit never sees a key.
+//
+// An invocation that grants tools through a runtime with no MCP
+// support is refused. Running it anyway would produce a plausible
+// answer with none of the tool calls the caller asked for, which is
+// the worst of both outcomes: it looks like it worked.
+func Drive(ctx context.Context, runtime string, in Invocation) (string, error) {
 	rt, ok := Runtimes[runtime]
 	if !ok {
 		return "", fmt.Errorf("unknown runtime %q", runtime)
 	}
-	cmd := exec.CommandContext(ctx, rt.Name, rt.Args(prompt)...)
+	if in.MCPConfig != "" && !rt.MCP {
+		return "", fmt.Errorf("runtime %q cannot be given an MCP server on the command line", runtime)
+	}
+	cmd := exec.CommandContext(ctx, rt.Name, rt.Args(in)...)
 	cmd.Env = SanitizeEnv(os.Environ())
 	out, err := cmd.CombinedOutput()
 	if err != nil {
